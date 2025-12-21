@@ -3,11 +3,18 @@
 PyTorch implementation of the **model definitions** for:
 
 **Mask-CDKD: A Source-Free and Label-Free Cross-Domain Knowledge Distillation Framework from SAM for Satellite Onboard VHR Land-Cover Mapping**  
-(ISPRS Journal of Photogrammetry and Remote Sensing)
-
-This repository is **model-only**: it contains the core network modules used in our paper (teacher/student architectures and the distiller wiring). It is intended for **inspection, integration, and minimal forward tests**.
 
 > **Pretrained weights: coming soon.**
+
+## Overview
+
+![Overview of onboard processing and Mask-CDKD](assets/fig1_overview.png)
+
+Mask-CDKD targets **onboard VHR remote sensing land-cover mapping** under strict compute/memory/power constraints. It performs **source-free & label-free** distillation from a SAM teacher using only target-domain imagery, while suppressing residual source-domain bias via adaptive feature calibration.
+
+![Mask-CDKD pipeline](assets/fig2_pipeline.png)
+
+The pipeline uses a **frozen SAM teacher backbone** equipped with trainable **MMoA (multi-scale adapters + gating)** to calibrate features in the target domain. A lightweight student is optimized in a **single stage** with **bidirectional feedback** (student aligns to teacher features while teacher adapters are updated), and a **dynamic loss schedule** balances distillation and masked reconstruction.
 
 ## Installation
 
@@ -45,7 +52,7 @@ print(len(pred_s), mae_s.shape)
 
 LuoJiaCDKD-100K contains **100,801 unlabeled 1024×1024** VHR remote sensing image tiles curated from multiple sources.
 
-* Download: **(add link here)**
+* Download: https://pan.baidu.com/s/1vlLz-TKtMmGQ7sdZslzQdg?pwd=rnyr
 * Please comply with the original licenses/terms of any upstream datasets if you redistribute derived subsets.
 
 ## SAM checkpoints
