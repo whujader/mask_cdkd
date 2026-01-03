@@ -4,7 +4,7 @@ PyTorch implementation of the **model definitions** for:
 
 **Mask-CDKD: A Source-Free and Label-Free Cross-Domain Knowledge Distillation Framework from SAM for Satellite Onboard VHR Land-Cover Mapping**  
 
-> **Pretrained weights: coming soon.**
+> **Pretrained weights:** https://pan.baidu.com/s/1F5tYkJUro5Fs-mKmGLraGA?pwd=qrbi
 
 ## Overview
 
