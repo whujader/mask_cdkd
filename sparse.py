@@ -119,12 +119,7 @@ class SparseAvgPool2d(nn.AvgPool2d):
 
 
 class SparseEncoder(nn.Module):
-    """Compatibility wrapper.
-
-    In your original code SparseEncoder(...) was used to wrap adapters.
-    For paper-consistent MMoA we no longer *require* this wrapper, but we keep it so
-    your repo's historical imports won't break.
-    """
+    """Compatibility wrapper."""
 
     def __init__(self, module: nn.Module, sbn: bool = False) -> None:
         super().__init__()

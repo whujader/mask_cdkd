@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common import MLPBlock, MultiScaleAdapter
+from sparse import set_active_mask, clear_active_mask, SparseConv2d, SparseMaxPool2d, SparseAvgPool2d
 
 __all__ = ["ImageEncoderViTMMoA", "build_sam_vit_l_teacher_mmoa"]
 
@@ -26,6 +27,67 @@ __all__ = ["ImageEncoderViTMMoA", "build_sam_vit_l_teacher_mmoa"]
 def trunc_normal_(tensor: torch.Tensor, std: float = 0.02) -> torch.Tensor:
     # light wrapper (avoid extra deps)
     return nn.init.trunc_normal_(tensor, std=std)
+
+
+def _convert_module_conv_pool_to_sparse(m: nn.Module) -> None:
+    """
+    Recursively replace Conv/Pool layers with Sparse* versions inside `m`.
+    Only touches:
+      - nn.Conv2d -> SparseConv2d (weights/bias copied)
+      - nn.MaxPool2d -> SparseMaxPool2d
+      - nn.AvgPool2d -> SparseAvgPool2d
+    """
+    for name, child in list(m.named_children()):
+        # 1) Conv2d -> SparseConv2d
+        if isinstance(child, nn.Conv2d) and (not isinstance(child, SparseConv2d)):
+            new = SparseConv2d(
+                in_channels=child.in_channels,
+                out_channels=child.out_channels,
+                kernel_size=child.kernel_size,
+                stride=child.stride,
+                padding=child.padding,
+                dilation=child.dilation,
+                groups=child.groups,
+                bias=(child.bias is not None),
+                padding_mode=child.padding_mode,
+            )
+            # IMPORTANT: move to same device/dtype BEFORE copying params
+            new = new.to(device=child.weight.device, dtype=child.weight.dtype)
+            new.weight.data.copy_(child.weight.data)
+            if child.bias is not None:
+                new.bias.data.copy_(child.bias.data)
+
+            setattr(m, name, new)
+            continue
+
+        # 2) MaxPool2d -> SparseMaxPool2d
+        if isinstance(child, nn.MaxPool2d) and (not isinstance(child, SparseMaxPool2d)):
+            new = SparseMaxPool2d(
+                kernel_size=child.kernel_size,
+                stride=child.stride,
+                padding=child.padding,
+                dilation=child.dilation,
+                return_indices=child.return_indices,
+                ceil_mode=child.ceil_mode,
+            )
+            setattr(m, name, new)
+            continue
+
+        # 3) AvgPool2d -> SparseAvgPool2d
+        if isinstance(child, nn.AvgPool2d) and (not isinstance(child, SparseAvgPool2d)):
+            new = SparseAvgPool2d(
+                kernel_size=child.kernel_size,
+                stride=child.stride,
+                padding=child.padding,
+                ceil_mode=child.ceil_mode,
+                count_include_pad=child.count_include_pad,
+                divisor_override=child.divisor_override,
+            )
+            setattr(m, name, new)
+            continue
+
+        # 4) recurse
+        _convert_module_conv_pool_to_sparse(child)
 
 
 # ---------------------------
@@ -277,6 +339,9 @@ class MMoABlock(nn.Module):
             act_layer=nn.GELU,
             skip_connect=False,
         )
+        _convert_module_conv_pool_to_sparse(self.adapter_fine)
+        _convert_module_conv_pool_to_sparse(self.adapter_coarse)
+
 
         # 3-expert gate (FFN + 2 adapters)
         self.gate = MoAGate(dim=dim, num_experts=3)
@@ -302,8 +367,17 @@ class MMoABlock(nn.Module):
         tokens = xn.view(b, h * w, c)  # (B,N,C)
 
         mlp_delta = self.mlp(xn).view(b, h * w, c)  # (B,N,C)
-        fine_delta = self.adapter_fine(tokens)      # (B,N,C)
-        coarse_delta = self.adapter_coarse(tokens)  # (B,N,C)
+        # fine_delta = self.adapter_fine(tokens)      # (B,N,C)
+        # coarse_delta = self.adapter_coarse(tokens)  # (B,N,C)
+        # Active mask must be (B,1,H,W) or (B,H,W), True/1=active, False/0=inactive.
+        active_mask = torch.ones((b, 1, h, w), device=xn.device, dtype=torch.bool)
+
+        set_active_mask(active_mask)
+        try:
+            fine_delta = self.adapter_fine(tokens)      # (B,N,C)
+            coarse_delta = self.adapter_coarse(tokens)  # (B,N,C)
+        finally:
+            clear_active_mask()
 
         weights = self.gate(tokens)                 # (B,N,3)
         outputs = torch.stack([mlp_delta, fine_delta, coarse_delta], dim=2)  # (B,N,3,C)

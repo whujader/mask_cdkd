@@ -1,11 +1,4 @@
 # student_vit_mae.py
-# -----------------------------------------------------------------------------
-# Mask-CDKD Student Model (ViT-S + MAE branch)
-# - Keep core architecture unchanged (ViT encoder + MAE-style decoder).
-# - Adjusted to match paper description:
-#   (1) MAE decoder depth = 4 (paper: "a four-layer decoder").
-#   (2) pos_embed_decoder uses shape (1, N, D) (no batch-size hardcoding).
-# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 

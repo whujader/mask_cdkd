@@ -5,75 +5,95 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Literal
+from typing import Dict, List, Optional, Sequence, Tuple, Literal, Union
 
-import torch
-import torch.nn as nn
+import luojianet_ms as ms
+import luojianet_ms.nn as nn
+import luojianet_ms.ops as ops
+from luojianet_ms import Tensor, Parameter
 
-
-Tensor = torch.Tensor
+TensorMS = Tensor
 
 
 # --------------------------- patchify & masked GT -----------------------------
 
-def patchify_rgb(images: Tensor, patch_size: int) -> Tensor:
+def patchify_rgb(images: TensorMS, patch_size: int) -> TensorMS:
     """
     images: (B, 3, H, W)
     returns: (B, N, P) where N=(H/p)*(W/p), P=3*p*p
     """
-    if images.dim() != 4:
+    if len(images.shape) != 4:
         raise ValueError(f"patchify_rgb expects (B,3,H,W), got {tuple(images.shape)}")
     b, c, h, w = images.shape
-    if c != 3:
-        raise ValueError(f"patchify_rgb expects 3 channels, got C={c}")
+    if int(c) != 3:
+        raise ValueError(f"patchify_rgb expects 3 channels, got C={int(c)}")
     p = int(patch_size)
-    if h % p != 0 or w % p != 0:
-        raise ValueError(f"H,W must be divisible by patch_size={p}, got {(h,w)}")
+    if int(h) % p != 0 or int(w) % p != 0:
+        raise ValueError(f"H,W must be divisible by patch_size={p}, got {(int(h), int(w))}")
 
-    gh, gw = h // p, w // p
-    x = images.reshape(b, c, gh, p, gw, p)
-    x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
-    return x.reshape(b, gh * gw, c * p * p)
+    gh, gw = int(h) // p, int(w) // p
+    reshape = ops.Reshape()
+    transpose = ops.Transpose()
+
+    x = reshape(images, (int(b), int(c), gh, p, gw, p))
+    x = transpose(x, (0, 2, 4, 1, 3, 5))
+    x = reshape(x, (int(b), gh * gw, int(c) * p * p))
+    return x
 
 
-def _ensure_2d_bool_mask(mask: Tensor, batch_size: int) -> Tensor:
+def _ensure_2d_bool_mask(mask: TensorMS, batch_size: int) -> TensorMS:
     """
     mask: (N,) or (B,N), True=masked
     returns: (B,N) bool
     """
-    if mask.dtype != torch.bool:
-        mask = mask.to(torch.bool)
-    if mask.dim() == 1:
-        mask = mask.unsqueeze(0).expand(batch_size, -1)
-    if mask.dim() != 2 or mask.size(0) != batch_size:
+    cast = ops.Cast()
+    if mask.dtype != ms.bool_:
+        mask = cast(mask, ms.bool_)
+    if len(mask.shape) == 1:
+        # (N,) -> (1,N) -> (B,N)
+        mask = ops.ExpandDims()(mask, 0)
+        mask = ops.BroadcastTo((int(batch_size), int(mask.shape[1])))(mask)
+    if len(mask.shape) != 2 or int(mask.shape[0]) != int(batch_size):
         raise ValueError(f"mask must be (N,) or (B,N), got {tuple(mask.shape)} with B={batch_size}")
     return mask
 
 
-def masked_patch_targets(images: Tensor, bool_masked_pos: Tensor, patch_size: int) -> Tensor:
+def masked_patch_targets(images: TensorMS, bool_masked_pos: TensorMS, patch_size: int) -> TensorMS:
     """
     images: (B,3,H,W)
     bool_masked_pos: (B,N) or (N,), True=masked
     returns: masked GT patches (B, N_mask, P)
     """
-    b = images.size(0)
+    b = int(images.shape[0])
     patches = patchify_rgb(images, patch_size)  # (B,N,P)
     mask = _ensure_2d_bool_mask(bool_masked_pos, b)  # (B,N)
 
-    n_mask = mask.sum(dim=1)
-    if not torch.all(n_mask == n_mask[0]):
+    # n_mask per sample
+    n_mask = ops.ReduceSum(keep_dims=False)(ops.Cast()(mask, ms.int32), 1)  # (B,)
+
+    # require same number of masked tokens in batch
+    # (MindSpore graph-friendly check still raises in eager/PyNative; kept to match PyTorch semantics)
+    n0 = int(n_mask[0].asnumpy().item())
+    if not bool((n_mask == n_mask[0]).all().asnumpy().item()):
         raise ValueError(
             "All samples in a batch must have the same number of masked tokens. "
             "Use a fixed-ratio mask generator."
         )
 
-    p_dim = patches.size(-1)
-    return patches[mask].reshape(b, int(n_mask[0].item()), p_dim)
+    p_dim = int(patches.shape[-1])
+
+    # PyTorch behavior: patches[mask] flattens batch then reshapes back to (B, N_mask, P).
+    flat = patches[mask]  # (B*N_mask, P)
+    return ops.Reshape()(flat, (b, n0, p_dim))
 
 
 # -------------------------- KD with projector bank ----------------------------
+
+class Identity(nn.Module):
+    def forward(self, x: TensorMS) -> TensorMS:
+        return x
+
 
 class KDProjectorBank(nn.Module):
     """
@@ -90,28 +110,33 @@ class KDProjectorBank(nn.Module):
         for ds, dt in zip(student_dims, teacher_dims):
             ds, dt = int(ds), int(dt)
             if ds == dt:
-                proj.append(nn.Identity())
+                proj.append(Identity())
             else:
-                proj.append(nn.Linear(ds, dt, bias=False))
+                proj.append(nn.Dense(ds, dt, has_bias=False))
         self.proj = nn.ModuleList(proj)
 
-    def forward(self, feats_s: Sequence[Tensor], feats_t: Sequence[Tensor]) -> Tensor:
+        self.reduce_mean = ops.ReduceMean(keep_dims=False)
+        self.stack = ops.Stack(axis=0)
+
+    def forward(self, feats_s: Sequence[TensorMS], feats_t: Sequence[TensorMS]) -> TensorMS:
         if len(feats_s) != len(feats_t) or len(feats_s) != len(self.proj):
             raise ValueError("Feature list length mismatch with projector bank.")
 
-        losses: List[Tensor] = []
+        losses: List[TensorMS] = []
         for i, (s, t) in enumerate(zip(feats_s, feats_t)):
-            if s.dim() != 3 or t.dim() != 3:
+            if len(s.shape) != 3 or len(t.shape) != 3:
                 raise ValueError(f"KD expects (B,N,D), got {tuple(s.shape)} and {tuple(t.shape)}")
-            if s.size(0) != t.size(0) or s.size(1) != t.size(1):
+            if int(s.shape[0]) != int(t.shape[0]) or int(s.shape[1]) != int(t.shape[1]):
                 raise ValueError(f"KD requires matching (B,N): {tuple(s.shape)} vs {tuple(t.shape)}")
 
             s_aligned = self.proj[i](s)  # (B,N,Dt)
-            if s_aligned.size(-1) != t.size(-1):
+            if int(s_aligned.shape[-1]) != int(t.shape[-1]):
                 raise ValueError("Projector output dim mismatch with teacher dim.")
-            losses.append((s_aligned - t).pow(2).mean())
 
-        return torch.stack(losses).mean()
+            diff = s_aligned - t
+            losses.append(self.reduce_mean(diff * diff))
+
+        return self.reduce_mean(self.stack(tuple(losses)))
 
 
 # -------------------- adaptation-state curriculum (paper) ---------------------
@@ -180,8 +205,13 @@ class MaskCDKDLoss(nn.Module):
 
         self.recon_target = recon_target
         self.images_are_sam_normalized = bool(images_are_sam_normalized)
-        self.register_buffer("pixel_mean", torch.tensor(sam_pixel_mean, dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
-        self.register_buffer("pixel_std", torch.tensor(sam_pixel_std, dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
+
+        self.pixel_mean = Tensor(sam_pixel_mean, ms.float32).view(1, 3, 1, 1)
+        self.pixel_std = Tensor(sam_pixel_std, ms.float32).view(1, 3, 1, 1)
+
+        self.reduce_mean = ops.ReduceMean(keep_dims=False)
+        self.clamp_min = ops.Maximum()
+        self.cast = ops.Cast()
 
     @property
     def state(self) -> str:
@@ -190,11 +220,10 @@ class MaskCDKDLoss(nn.Module):
     def reset_state(self) -> None:
         self._state = self.schedule.init_state()
 
-    @torch.no_grad()
     def _update_state(self, r_value: float) -> None:
-        self._state = self.schedule.step(self._state, r_value)
+        self._state = self.schedule.step(self._state, float(r_value))
 
-    def _prepare_recon_target_image(self, images: Tensor) -> Tensor:
+    def _prepare_recon_target_image(self, images: TensorMS) -> TensorMS:
         # Paper defines MAE loss on pixel values in Omega.
         # Default: unnormalize SAM-normalized input back to raw [0,255] space.
         if self.recon_target == "normalized":
@@ -206,14 +235,14 @@ class MaskCDKDLoss(nn.Module):
     def forward(
         self,
         *,
-        feats_s: Sequence[Tensor],
-        feats_t: Sequence[Tensor],
-        pred_s: Tensor,  # (B, N_mask, patch_dim)
-        pred_t: Tensor,  # (B, N_mask, patch_dim)
-        images: Tensor,  # (B, 3, H, W)
-        mask_s: Tensor,  # (B, N) or (N,), True=masked
-        mask_t: Optional[Tensor] = None,
-    ) -> Dict[str, Tensor]:
+        feats_s: Sequence[TensorMS],
+        feats_t: Sequence[TensorMS],
+        pred_s: TensorMS,  # (B, N_mask, patch_dim)
+        pred_t: TensorMS,  # (B, N_mask, patch_dim)
+        images: TensorMS,  # (B, 3, H, W)
+        mask_s: TensorMS,  # (B, N) or (N,), True=masked
+        mask_t: Optional[TensorMS] = None,
+    ) -> Dict[str, TensorMS]:
         if mask_t is None:
             mask_t = mask_s
 
@@ -225,28 +254,35 @@ class MaskCDKDLoss(nn.Module):
         gt_s = masked_patch_targets(target_img, mask_s, self.patch_size)  # (B,N_mask,P)
         gt_t = masked_patch_targets(target_img, mask_t, self.patch_size)
 
-        if pred_s.shape != gt_s.shape:
+        if tuple(pred_s.shape) != tuple(gt_s.shape):
             raise ValueError(f"Student pred {tuple(pred_s.shape)} != GT {tuple(gt_s.shape)}")
-        if pred_t.shape != gt_t.shape:
+        if tuple(pred_t.shape) != tuple(gt_t.shape):
             raise ValueError(f"Teacher pred {tuple(pred_t.shape)} != GT {tuple(gt_t.shape)}")
 
-        loss_s_mae = (pred_s - gt_s).pow(2).mean()
-        loss_t_mae = (pred_t - gt_t).pow(2).mean()
+        diff_s = pred_s - gt_s
+        diff_t = pred_t - gt_t
+        loss_s_mae = self.reduce_mean(diff_s * diff_s)
+        loss_t_mae = self.reduce_mean(diff_t * diff_t)
 
         # 3) r-driven schedule
-        r = (loss_t_mae.detach() / (loss_s_mae.detach() + self.eps)).clamp(min=0.0)
-        self._update_state(float(r.item()))
+        # r = clamp_min(loss_t / (loss_s + eps), 0.0)
+        r = loss_t_mae / (loss_s_mae + Tensor(self.eps, ms.float32))
+        r = self.clamp_min(r, Tensor(0.0, ms.float32))
+
+        # update schedule state in python-side
+        self._update_state(float(r.asnumpy().item()))
         lam1, lam2, lam3 = self.schedule.weights(self._state)
 
-        loss_total = lam1 * loss_kd + lam2 * loss_t_mae + lam3 * loss_s_mae
+        loss_total = Tensor(lam1, ms.float32) * loss_kd + Tensor(lam2, ms.float32) * loss_t_mae + Tensor(lam3, ms.float32) * loss_s_mae
 
+        # MindSpore doesn't have .detach(); return raw tensors like PyTorch "detached" scalars
         return {
             "loss_total": loss_total,
-            "loss_kd": loss_kd.detach(),
-            "loss_t_mae": loss_t_mae.detach(),
-            "loss_s_mae": loss_s_mae.detach(),
-            "r_t_over_s": r.detach(),
-            "lambda_kd": torch.tensor(lam1, device=loss_total.device),
-            "lambda_t_mae": torch.tensor(lam2, device=loss_total.device),
-            "lambda_s_mae": torch.tensor(lam3, device=loss_total.device),
+            "loss_kd": loss_kd,
+            "loss_t_mae": loss_t_mae,
+            "loss_s_mae": loss_s_mae,
+            "r_t_over_s": r,
+            "lambda_kd": Tensor(lam1, ms.float32),
+            "lambda_t_mae": Tensor(lam2, ms.float32),
+            "lambda_s_mae": Tensor(lam3, ms.float32),
         }
