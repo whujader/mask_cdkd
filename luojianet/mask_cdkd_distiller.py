@@ -16,8 +16,8 @@ import luojianet_ms.nn as nn
 import luojianet_ms.ops as ops
 from luojianet_ms import Tensor
 
-from teacher_sam_vit_mmoa_ms import ImageEncoderViTMMoA, build_sam_vit_l_teacher_mmoa
-from student_vit_mae_ms import VisionTransformer, build_mask_cdkd_student_vit_small_1024
+from teacher_sam_vit_mmoa import ImageEncoderViTMMoA, build_sam_vit_l_teacher_mmoa
+from student_vit_mae import VisionTransformer, build_mask_cdkd_student_vit_small_1024
 
 __all__ = [
     "TeacherConfig",
